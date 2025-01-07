@@ -1,4 +1,4 @@
-# Lydhørt studieval
+# Lydhørt studievalg
 
 <!-- ABOUT -->
 ## Om
