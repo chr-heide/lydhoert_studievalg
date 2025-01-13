@@ -21,3 +21,5 @@ Mappen *code* indeholder al kode jeg har brugt. Der er en fil, der viser hvordan
 Mappen *data* indeholder al data jeg har brugt. *processed/ansøgninger_1997-2024.RDS*-filen er den data-fil, som selve analysen bygger på, og er i sig selv nok til at reproducere resultaterne. Øvrige datafiler er blot dem jeg i preprocessing-scriptet merger - men for gennemsigtighedens skyld er de også tilgængelige. Med de uploadede scripts og datafiler er det altså muligt at reproducere mine resultater fuldstændigt fra den rå data, som jeg har hentet den fra UFMs hjemmeside.
 
 Mappen *plots* indeholder de plots, der indgår i opgaven.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
