@@ -1,0 +1,1109 @@
+---
+title: "Job Choice, main analysis"
+format: 
+  html:
+    toc: true
+    self-contained: true
+    code-fold: true
+editor: source
+author: Christian Heide
+theme: flatly
+execute: 
+  cache: true
+  echo: true
+  warning: false
+  message: false
+  fig-width: 9
+  fig-height: 7
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+## Data & libraries
+
+```{r}
+# Libraries
+library(tidyverse)
+library(gsynth)
+library(panelView)
+library(xtable)
+library(patchwork)
+library(stargazer)
+
+# Data
+df <- readRDS(paste0(here::here(), "/data/processed/ansøgninger_1997-2024.RDS"))
+```
+
+## Functions
+
+### Linear imputing
+
+```{r}
+ # To impute missing values
+lm_impute <- function(df, missing_var, rhs, education) {
+  
+  edu_df <- df |> 
+    filter(uddannelse == education)
+  
+  # Indices of rows with missing values
+  missing_rows <- which(is.na(df[[missing_var]]) & df$uddannelse == education)
+  
+  if (nrow(edu_df) > length(missing_rows)) {
+    
+    # Linear model
+    temp_model <- lm(
+      formula = as.formula(paste(missing_var, "~", rhs)),
+      data = edu_df,
+      na.action = na.exclude
+      )
+    
+    # Using model to impute missing values
+    df[[missing_var]][missing_rows] <- predict(temp_model, df[missing_rows,])
+    
+  }
+  
+  return(df)
+}
+```
+
+### Reporting
+
+```{r}
+report_results <- function(fit, education_name, t0, pre_se = "bootstrapped") {
+  
+  # Data frames with complete observations for pretty plotting
+  if (education_name == "Folkeskolelærer") {
+    complete_df <- teacher_df |> 
+      filter(år <= 2019 & !is.na(ansøgninger_main)) |> 
+      group_by(uddannelse) |> 
+      summarise(n = n()) |> 
+      filter(n == max(n))
+    
+  } else if (education_name == "Sygeplejerske (kvote 1)") {
+    complete_df <- nurse_df_k1 |> 
+      filter(!is.na(ansøgninger_main)) |> 
+      group_by(uddannelse) |> 
+      summarise(n = n()) |> 
+      filter(n == max(n))
+    
+  } else if (education_name == "Sygeplejerske (kvote 2)") {
+    complete_df <- nurse_df_k2 |>
+      filter(!is.na(ansøgninger_main)) |> 
+      group_by(uddannelse) |> 
+      summarise(n = n()) |> 
+      filter(n == max(n))
+      
+  } else {
+    complete_df <- NULL
+  }
+  
+  # First making counterfactual data frame
+  ct_df <- data.frame(
+    education = education_name,
+    t = as.vector(fit[["time"]]),
+    observed = as.vector(fit[["Y.tr"]]),
+    sc = as.vector(fit[["Y.ct"]]),
+    t0 = t0)
+  
+  # Making controls data frame
+  controls_df <- cbind(ct_df, fit[["Y.dat"]]) |> 
+    pivot_longer(cols = -c(education, t, observed, sc, t0),
+               names_to = "control_education",
+               values_to = "applications") |> 
+    filter(control_education != education_name)
+  
+  # Only including complete data series in plot
+  if (!is.null(complete_df)) {
+    controls_df <- controls_df |> 
+      filter(control_education %in% complete_df$uddannelse)
+  }
+  
+  # Making gap data frame
+  gap_df <- ct_df |> 
+    mutate(estimate = observed - sc) |> 
+    bind_cols(as.data.frame(fit[["est.att"]]))
+  
+  if (pre_se == "mspe") {
+    gap_df <- gap_df |> 
+      mutate(
+        CI.lower = if_else(
+          n.Treated == 0,
+          estimate - 1.96 * sqrt(fit[["MSPE"]] / sum(as.vector(fit[["est.att"]][,"n.Treated"]) == 0)),
+          CI.lower),
+        CI.upper = if_else(
+          n.Treated == 0,
+          estimate + 1.96 * sqrt(fit[["MSPE"]] / sum(as.vector(fit[["est.att"]][,"n.Treated"]) == 0)),
+          CI.upper))
+  }
+  
+  # Making plots
+  ct_plot <- ct_df |> 
+    ggplot(aes(y = observed, x = t)) +
+    geom_line(
+      aes(linetype = "Observed"),
+      color = "black",
+      linewidth = 1) +
+    geom_line(
+      aes(y = sc, linetype = "Synthetic"),
+      linewidth = 1) +
+    geom_vline(aes(xintercept = t0), linetype = "dotted") +
+    geom_line(
+      data = controls_df,
+      aes(x = t, y = applications, group = control_education, linetype = "Donor educations"),
+      inherit.aes = FALSE,
+      color = "grey",
+      alpha = 0.5) +
+    scale_linetype_manual(
+      values = c(
+        "Observed" = "solid",
+        "Synthetic" = "dashed",
+        "Donor educations" = "solid")) +
+    scale_x_continuous(expand = c(0, 0)) +
+    theme_bw() +
+    theme(legend.position = "bottom") +
+    labs(
+      x = NULL,
+      y = "Applications",
+      linetype = NULL) +
+    ggtitle("A. Observed and counterfactual development")
+  
+  gap_plot <- ggplot(gap_df, aes(x = t, y = estimate)) +
+   geom_line(color = "black", linewidth = 1) +
+   geom_ribbon(aes(ymin = CI.lower, ymax = CI.upper), alpha = 0.3) + 
+   geom_hline(yintercept = 0) +
+   geom_vline(aes(xintercept = t0), linetype = "dotted") +
+   scale_x_continuous(expand = c(0, 0)) +
+   theme_bw() +
+   labs(x = NULL,
+        y = "Estimate") +
+   ggtitle("B. Effect estimates")
+  
+  return(list(ct_plot, gap_plot))
+  
+  }
+
+
+```
+
+# Data prep
+
+## Nurse data
+
+For nurses I make the following transformations: 1) Excluding teachers (also treated, should not be included) 2) Linearly imputing the trend in share kvote 2-applications for years prior to 2009, where this is missing. This is used to split in kvote 1 and 2. 3) Split into different data frames (kvote 1, kvote 2, all applications)
+
+```{r}
+nurse_df_total <- df |> 
+  filter(treatment != "Lærerlockout")
+
+# Imputing missing values
+for (u in unique(nurse_df_total$uddannelse)) {
+  nurse_df_total <- nurse_df_total |> 
+    lm_impute(missing_var = "andel_kvote2_prio1", rhs = "år", education = u) |> 
+    lm_impute(missing_var = "andel_kvote2_total", rhs = "år", education = u)
+}
+
+# Calculating number of kvote 2 applications
+nurse_df_total <- nurse_df_total |> 
+  mutate(
+    ansøgninger_prio1_kvote2 = if_else(
+      år < 2009,
+      ansøgninger_prio1 * andel_kvote2_prio1,
+      ansøgninger_prio1_kvote2),
+    ansøgninger_total_kvote2 = if_else(
+      år < 2009,
+      ansøgninger_total * andel_kvote2_total,
+      ansøgninger_total_kvote2))
+
+# Fixing the name of the education
+nurse_df_total <- nurse_df_total |> 
+  mutate(uddannelse = if_else(
+     treatment == "Sygeplejerskestrejke",
+     "Sygeplejerske",
+     uddannelse))
+
+# Splitting into kvote 1 and kvote 2 data frames
+nurse_df_k1 <- nurse_df_total |> 
+  mutate(
+    ansøgninger_main = ansøgninger_prio1 - ansøgninger_prio1_kvote2,
+    ansøgninger_robust_total = ansøgninger_total - ansøgninger_total_kvote2,
+    # Fixing name (just for plotting conveniece)
+    uddannelse = if_else(
+      treatment == "Sygeplejerskestrejke",
+      "Sygeplejerske (kvote 1)",
+      uddannelse))
+
+nurse_df_k2 <- nurse_df_total |> 
+  mutate(
+    ansøgninger_main = ansøgninger_prio1_kvote2,
+    ansøgninger_robust_total = ansøgninger_total_kvote2,
+    # Fixing name (just for plotting conveniece)
+    uddannelse = if_else(
+      treatment == "Sygeplejerskestrejke",
+      "Sygeplejerske (kvote 2)",
+      uddannelse))
+
+```
+
+## Teacher data
+1) Excluding nurses, 2) Estimating share with a grade avarage above 7
+
+```{r}
+# No grade-data before 2009 so I impute the 2009-value.
+teacher_df <- df |> 
+  filter(treatment != "Sygeplejerskestrejke" & år <= 2019) |> 
+  group_by(uddannelse) |> 
+  mutate(
+    grade_2009 = ifelse(any(år == 2010), karakter[år == 2009], NA),
+    karakter = ifelse(år < 2009 & is.na(karakter), grade_2009, karakter)
+  ) |> 
+  select(-grade_2009) |> 
+  ungroup()
+
+# Estimating the share with a grade above 7 by
+# 1) assuming a weibull-distribution (main)
+shape <-  2.2
+teacher_df$andel_over7 <- with(
+  teacher_df,
+  (1 - pweibull(7, shape = shape, scale = (karakter) / gamma(1 + 1 / shape))))
+
+# 2) assuming a normal distribution (robustness)
+teacher_df$andel_over7_alternativ <- with(teacher_df, (1 - pnorm(7, mean = karakter, sd = 2)))
+
+# Calculating applications with a grade above 7
+teacher_df <- teacher_df |> 
+  mutate(
+    ansøgninger_main = ansøgninger_prio1 * andel_over7,
+    ansøgninger_main_robust = ansøgninger_prio1 * andel_over7_alternativ,
+    ansøgninger_robust_total = ansøgninger_total * andel_over7,
+    ansøgninger_robust_uopdelt = ansøgninger_prio1,
+    uddannelse = if_else(
+      treatment == "Lærerlockout",
+      "Folkeskolelærer",
+      uddannelse))
+
+```
+
+# Nurse analysis
+
+## Main model
+
+```{r, include=FALSE}
+gsk_df <- nurse_df_k1 |> 
+  filter(uddannelsesniveau == "Prof. bachelor")
+
+
+fit_nurse_k1_main <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 5,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20
+)
+
+```
+
+### Plots
+
+```{r}
+nurse_k1_main <- report_results(
+  fit = fit_nurse_k1_main,
+  education_name = "Sygeplejerske (kvote 1)",
+  t0 = 2020)
+
+nurse_k1_main[[1]] | nurse_k1_main[[2]]
+```
+
+### Effects
+
+```{r}
+results <- data.frame(
+  year = as.vector(fit_nurse_k1_main[["time"]]),
+  y_actual = as.vector(fit_nurse_k1_main[["Y.tr"]]),
+  y_synthetic = as.vector(fit_nurse_k1_main[["Y.ct"]])) |> 
+  mutate(att = y_actual - y_synthetic,
+         att_perc = (att / y_synthetic) * 100)
+
+print(results)
+```
+
+
+### ATT per year
+
+```{r}
+cumuEff(fit_nurse_k1_main, cumu = FALSE)
+```
+
+### Cumulative effect
+
+```{r}
+cumuEff(fit_nurse_k1_main)
+```
+
+## Placebo: Kvote 2-applications
+
+```{r, include=FALSE}
+gsk_df <- nurse_df_k2 |> 
+  filter(uddannelsesniveau == "Prof. bachelor")
+
+
+fit_nurse_k2_main <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 5,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20
+)
+
+```
+
+```{r}
+nurse_k2_main <- report_results(
+  fit = fit_nurse_k2_main,
+  education_name = "Sygeplejerske (kvote 2)",
+  t0 = 2020)
+
+nurse_k2_main[[1]] | nurse_k2_main[[2]]
+```
+
+## Robustness: Joint estimation of kvote 1 and 2 (kvote 2 t0 = 2022)
+
+```{r, include=FALSE}
+# NOTE: Should probably do this differently - currently control units are in 
+# total priority 1 applications, while it is split into kvote 1 and 2 for
+# the treated. I suppose that optimally control units should also be split, but
+# then again it is only for robustness. But this might actually be interesting to
+# explore further?
+gsk_df <- nurse_df_total |> 
+  filter(treatment != "Sygeplejerskestrejke" &
+           uddannelsesniveau == "Prof. bachelor") |> 
+  mutate(ansøgninger_main = ansøgninger_prio1) |> 
+  bind_rows(
+    nurse_df_k1 |> filter(treatment == "Sygeplejerskestrejke")) |> 
+  bind_rows(
+    nurse_df_k2 |> 
+      filter(treatment == "Sygeplejerskestrejke") |> 
+      mutate(d = if_else(
+        år == 2021,
+        0,
+        d)))
+
+
+fit_nurse_joint <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 5,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20
+)
+
+```
+
+```{r}
+
+
+plot(fit_nurse_joint, type = "ct") | plot(fit_nurse_joint, type = "gap")
+
+```
+
+## Robustness: All priority 1 applications (not split in kvote 1 & 2)
+
+```{r, include=FALSE}
+gsk_df <- nurse_df_total |> 
+  filter(uddannelsesniveau == "Prof. bachelor")
+
+
+fit_nurse_k1_all <- gsynth(
+  Y = "ansøgninger_prio1",
+  D = "d",
+  X = c("andel_kvinder_prio1"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 5,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20
+)
+
+```
+
+```{r}
+nurse_k1_all <- report_results(
+  fit = fit_nurse_k1_all,
+  education_name = "Sygeplejerske",
+  t0 = 2020)
+
+nurse_k1_all[[1]] | nurse_k1_all[[2]]
+```
+
+## Robustness: MSPE-based pre-treatment SE instead of bootstrapped (doesn't affect results)
+
+```{r, include=FALSE}
+nurse_k1_main <- report_results(
+  fit = fit_nurse_k1_main,
+  education_name = "Sygeplejerske (kvote 1)",
+  t0 = 2020,
+  pre_se = "mspe")
+
+```
+
+```{r}
+nurse_k1_main[[1]] | nurse_k1_main[[2]]
+```
+
+## Robustness: All levels of educations included as donors
+
+```{r, include=FALSE}
+fit_nurse_k1_all_levels <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1"),
+  data = nurse_df_k1,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 5,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20
+)
+
+```
+
+```{r}
+nurse_k1_all_levels <- report_results(
+  fit = fit_nurse_k1_all_levels,
+  education_name = "Sygeplejerske (kvote 1)",
+  t0 = 2020)
+
+nurse_k1_all_levels[[1]] | nurse_k1_all_levels[[2]]
+```
+
+## Robustness: IFE estimator (crossvalidated, r = 1)
+
+```{r, include=FALSE}
+gsk_df <- nurse_df_k1 |> 
+  filter(uddannelsesniveau == "Prof. bachelor")
+
+fit_nurse_k1_ife_cv <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  EM = TRUE,
+  se = TRUE,
+  CV = TRUE,
+  force = "two-way",
+  inference = "parametric",
+  min.T0 = 7,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20,
+)
+```
+
+```{r}
+nurse_k1_ife_cv <- report_results(
+  fit = fit_nurse_k1_ife_cv,
+  education_name = "Sygeplejerske (kvote 1)",
+  t0 = 2020)
+
+nurse_k1_ife_cv[[1]] | nurse_k1_ife_cv[[2]]
+```
+
+## Robustness: IFE estimator (r = 5)
+
+```{r, include=FALSE}
+gsk_df <- nurse_df_k1 |> 
+  filter(uddannelsesniveau == "Prof. bachelor")
+
+fit_nurse_k1_ife_5 <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  EM = TRUE,
+  se = TRUE,
+  CV = FALSE,
+  r = 5,
+  force = "two-way",
+  inference = "parametric",
+  min.T0 = 7,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20,
+)
+```
+
+```{r}
+nurse_k1_ife_5 <- report_results(
+  fit = fit_nurse_k1_ife_5,
+  education_name = "Sygeplejerske (kvote 1)",
+  t0 = 2020)
+
+nurse_k1_ife_5[[1]] | nurse_k1_ife_5[[2]]
+```
+
+## Robustness: Total kvote 1 applications as outcome
+
+```{r, include=FALSE}
+gsk_df <- nurse_df_k1 |> 
+  filter(uddannelsesniveau == "Prof. bachelor")
+
+
+fit_nurse_k1_total <- gsynth(
+  Y = "ansøgninger_robust_total",
+  D = "d",
+  X = c("andel_kvinder_prio1"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 5,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20
+)
+
+```
+
+```{r}
+nurse_k1_total <- report_results(
+  fit = fit_nurse_k1_total,
+  education_name = "Sygeplejerske (kvote 1)",
+  t0 = 2020)
+
+nurse_k1_total[[1]] | nurse_k1_total[[2]]
+```
+
+## Robustness: Balanced panel
+
+```{r, include=FALSE}
+gsk_df <- nurse_df_k1 |> 
+  filter(uddannelsesniveau == "Prof. bachelor") |> 
+  group_by(uddannelse) |> 
+  mutate(n = n()) |> 
+  ungroup() |> 
+  filter(n >= 28)
+
+
+fit_nurse_k1_balanced <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 5,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20
+)
+
+```
+
+```{r}
+nurse_k1_balanced <- report_results(
+  fit = fit_nurse_k1_balanced,
+  education_name = "Sygeplejerske (kvote 1)",
+  t0 = 2020)
+
+nurse_k1_balanced[[1]] | nurse_k1_balanced[[2]]
+```
+
+## Robustness: Only 2009 and after included
+
+```{r, include=FALSE}
+gsk_df <- nurse_df_k1 |> 
+  filter(uddannelsesniveau == "Prof. bachelor") |> 
+  filter(år >= 2009)
+
+
+fit_nurse_k1_post2008 <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 4,
+  nboots = 1000,
+  seed = 5,
+  nlambda = 20
+)
+
+
+```
+
+```{r}
+nurse_k1_post2008 <- report_results(
+  fit = fit_nurse_k1_post2008,
+  education_name = "Sygeplejerske (kvote 1)",
+  t0 = 2020)
+
+nurse_k1_post2008[[1]] | nurse_k1_post2008[[2]]
+```
+
+## Robustness: In-place placebos
+
+```{r, include=FALSE}
+
+place_placebos_nurse_k1 <- data.frame()
+
+complete_obs <- nurse_df_k1 |> 
+  filter(uddannelsesniveau == "Prof. bachelor") |> 
+  filter(!is.na(ansøgninger_main)) |> 
+  group_by(uddannelse) |> 
+  mutate(n = n()) |> 
+  ungroup() |> 
+  filter(n >= 28)
+
+for (u in unique(complete_obs$uddannelse)) {
+  
+  gsk_df <- nurse_df_k1 |> 
+    filter(uddannelsesniveau == "Prof. bachelor") |> 
+    mutate(d = if_else(
+      uddannelse == u & år >= 2021,
+      1,
+      0))
+  
+  out_nurse_k1 <- gsynth(
+    Y = "ansøgninger_main",
+    D = "d",
+    X = c("andel_kvinder_prio1"),
+    data = gsk_df,
+    index = c("uddannelse", "år"),
+    na.rm = TRUE,
+    se = TRUE,
+    force = "two-way",
+    estimator = "mc",
+    min.T0 = 5,
+    #nboots = 1000,
+    seed = 4,
+    CV = TRUE)
+  
+  temp <- data.frame(
+    uddannelse = u,
+    t = as.vector(out_nurse_k1[["time"]]),
+    faktisk = as.vector(out_nurse_k1[["Y.tr"]]),
+    sk = as.vector(out_nurse_k1[["Y.ct"]]),
+    t0 = 2020)
+  
+  place_placebos_nurse_k1 <- rbind(place_placebos_nurse_k1, temp)
+  
+}
+
+place_placebos_nurse_k1 <- place_placebos_nurse_k1 |> 
+  mutate(estimate = faktisk - sk,
+         d = if_else(
+           uddannelse == "Sygeplejerske (kvote 1)",
+           "Nurses",
+           "Placebo"))
+```
+
+```{r}
+place_placebos_nurse_k1 |> 
+  ggplot(aes(x = t, y = estimate, group = uddannelse, color = d)) +
+  geom_line() +
+  xlim(c(1997, 2024)) +
+  scale_color_manual(
+    values = c(
+      "Placebo" = "grey",
+      "Nurses" = "black")) +
+  theme_bw()
+```
+
+# Teacher
+
+## Main model
+
+```{r, include=FALSE}
+gsk_df <- teacher_df |> 
+  filter(uddannelsesniveau == "Prof. bachelor")
+
+
+fit_teacher_main <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1", "karakter"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 5,
+  nboots = 1000,
+  seed = 4
+)
+
+```
+
+### Plots
+
+```{r}
+teacher_main <- report_results(
+  fit = fit_teacher_main,
+  education_name = "Folkeskolelærer",
+  t0 = 2012)
+
+teacher_main[[1]] | teacher_main[[2]]
+```
+
+### Effects
+
+```{r}
+results <- data.frame(
+  year = as.vector(fit_teacher_main[["time"]]),
+  y_actual = as.vector(fit_teacher_main[["Y.tr"]]),
+  y_synthetic = as.vector(fit_teacher_main[["Y.ct"]])) |> 
+  mutate(att = y_actual - y_synthetic,
+         att_perc = (att / y_synthetic) * 100)
+
+print(results)
+```
+
+
+### ATT per year
+
+```{r}
+cumuEff(fit_teacher_main, cumu = FALSE)
+```
+
+### Cumulative effect
+
+```{r}
+cumuEff(fit_teacher_main)
+```
+
+## Robustness: All priority 1 applications (not only above 7)
+
+```{r, include=FALSE}
+gsk_df <- teacher_df |> 
+  filter(uddannelsesniveau == "Prof. bachelor")
+
+
+fit_teacher_all <- gsynth(
+  Y = "ansøgninger_robust_uopdelt",
+  D = "d",
+  X = c("andel_kvinder_prio1", "karakter"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 4,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20
+)
+
+```
+
+```{r}
+teacher_all <- report_results(
+  fit = fit_teacher_all,
+  education_name = "Folkeskolelærer",
+  t0 = 2012)
+
+teacher_all[[1]] | teacher_all[[2]]
+```
+
+## Robustness: MSPE-based pre-treatment SE instead of bootstrapped (doesn't affect results)
+
+```{r, include=FALSE}
+teacher_main <- report_results(
+  fit = fit_teacher_main,
+  education_name = "Folkeskolelærer",
+  t0 = 2012,
+  pre_se = "mspe")
+
+```
+
+```{r}
+teacher_main[[1]] | teacher_main[[2]]
+```
+
+## Robustness: All levels of educations included as donors
+
+```{r, include=FALSE}
+fit_teacher_all_levels <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1", "karakter"),
+  data = teacher_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 5,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20
+)
+
+```
+
+```{r}
+teacher_all_levels <- report_results(
+  fit = fit_teacher_all_levels,
+  education_name = "Folkeskolelærer",
+  t0 = 2012)
+
+teacher_all_levels[[1]] | teacher_all_levels[[2]]
+```
+
+## Robustness: IFE estimator (crossvalidated, r = 3)
+
+```{r, include=FALSE}
+gsk_df <- teacher_df |> 
+  filter(uddannelsesniveau == "Prof. bachelor")
+
+fit_teacher_ife_cv <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1", "karakter"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  EM = TRUE,
+  se = TRUE,
+  CV = TRUE,
+  force = "two-way",
+  inference = "parametric",
+  min.T0 = 7,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20,
+)
+```
+
+```{r}
+teacher_ife_cv <- report_results(
+  fit = fit_teacher_ife_cv,
+  education_name = "Folkeskolelærer",
+  t0 = 2012)
+
+teacher_ife_cv[[1]] | teacher_ife_cv[[2]]
+```
+
+## Robustness: IFE estimator (r = 5)
+
+```{r, include=FALSE}
+gsk_df <- teacher_df |> 
+  filter(uddannelsesniveau == "Prof. bachelor")
+
+fit_teacher_ife_5 <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1", "karakter"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  EM = TRUE,
+  se = TRUE,
+  CV = FALSE,
+  r = 5,
+  force = "two-way",
+  inference = "parametric",
+  min.T0 = 7,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20,
+)
+```
+
+```{r}
+teacher_ife_5 <- report_results(
+  fit = fit_teacher_ife_5,
+  education_name = "Folkeskolelærer",
+  t0 = 2012)
+
+teacher_ife_5[[1]] | teacher_ife_5[[2]]
+```
+
+## Robustness: Total applications as outcome
+
+```{r, include=FALSE}
+gsk_df <- teacher_df |> 
+  filter(uddannelsesniveau == "Prof. bachelor")
+
+
+fit_teacher_total <- gsynth(
+  Y = "ansøgninger_robust_total",
+  D = "d",
+  X = c("andel_kvinder_prio1", "karakter"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 4,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20
+)
+
+```
+
+```{r}
+teacher_total <- report_results(
+  fit = fit_teacher_total,
+  education_name = "Folkeskolelærer",
+  t0 = 2012)
+
+teacher_total[[1]] | teacher_total[[2]]
+```
+
+## Robustness: Balanced panel
+
+```{r, include=FALSE}
+gsk_df <- teacher_df |> 
+  filter(uddannelsesniveau == "Prof. bachelor") |> 
+  group_by(uddannelse) |> 
+  mutate(n = n()) |> 
+  ungroup() |> 
+  filter(n >= 23)
+
+
+fit_teacher_balanced <- gsynth(
+  Y = "ansøgninger_main",
+  D = "d",
+  X = c("andel_kvinder_prio1", "karakter"),
+  data = gsk_df,
+  index = c("uddannelse", "år"),
+  na.rm = TRUE,
+  se = TRUE,
+  force = "two-way",
+  estimator = "mc",
+  min.T0 = 5,
+  nboots = 1000,
+  seed = 4,
+  nlambda = 20
+)
+
+```
+
+```{r}
+teacher_balanced <- report_results(
+  fit = fit_teacher_balanced,
+  education_name = "Folkeskolelærer",
+  t0 = 2012)
+
+teacher_balanced[[1]] | teacher_balanced[[2]]
+```
+
+## Robustness: In-place placebos
+
+```{r, include=FALSE}
+
+place_placebos_teacher <- data.frame()
+
+complete_obs <- teacher_df |> 
+  filter(uddannelsesniveau == "Prof. bachelor") |> 
+  filter(!is.na(ansøgninger_main)) |> 
+  group_by(uddannelse) |> 
+  mutate(n = n()) |> 
+  ungroup() |> 
+  filter(n >= 23)
+
+for (u in unique(complete_obs$uddannelse)) {
+  
+  gsk_df <- teacher_df |> 
+    filter(uddannelsesniveau == "Prof. bachelor") |> 
+    mutate(d = if_else(
+      uddannelse == u & år >= 2013,
+      1,
+      0))
+  
+  out_teacher <- gsynth(
+    Y = "ansøgninger_main",
+    D = "d",
+    X = c("andel_kvinder_prio1", "karakter"),
+    data = gsk_df,
+    index = c("uddannelse", "år"),
+    na.rm = TRUE,
+    se = TRUE,
+    force = "two-way",
+    estimator = "mc",
+    min.T0 = 5,
+    #nboots = 1000,
+    seed = 4,
+    CV = TRUE)
+  
+  temp <- data.frame(
+    uddannelse = u,
+    t = as.vector(out_teacher[["time"]]),
+    faktisk = as.vector(out_teacher[["Y.tr"]]),
+    sk = as.vector(out_teacher[["Y.ct"]]),
+    t0 = 2012)
+  
+  place_placebos_teacher <- rbind(place_placebos_teacher, temp)
+  
+}
+
+place_placebos_teacher <- place_placebos_teacher |> 
+  mutate(estimate = faktisk - sk,
+         d = if_else(
+           uddannelse == "Folkeskolelærer",
+           "Teachers",
+           "Placebo"))
+```
+
+```{r}
+place_placebos_teacher |> 
+  ggplot(aes(x = t, y = estimate, group = uddannelse, color = d)) +
+  geom_line() +
+  xlim(c(1997, 2019)) +
+  scale_color_manual(
+    values = c(
+      "Placebo" = "grey",
+      "Teachers" = "black")) +
+  theme_bw()
+```
